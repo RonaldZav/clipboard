@@ -1,0 +1,14 @@
+[package]
+name = "clipboard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arboard = "3.3.0"
+eframe = "0.26.0"
+enigo = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+anyhow = "1.0"
+parking_lot = "0.12"
