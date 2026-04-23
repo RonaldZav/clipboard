@@ -1,0 +1,5 @@
+[env]
+PKG_CONFIG_PATH = "/tmp/pkgconfig"
+
+[build]
+rustflags = ["-L", "/tmp/mylibs", "-L", "/usr/lib/x86_64-linux-gnu"]

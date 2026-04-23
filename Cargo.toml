@@ -4,9 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arboard = "3.3.0"
-eframe = "0.26.0"
+# Wayland layer shell
+wayland-client = { version = "0.31", features = ["system"] }
+smithay-client-toolkit = { version = "0.18", features = ["calloop"] }
+
+# GPU rendering
+wgpu = "0.20"
+egui = "0.28"
+egui-wgpu = "0.28"
+raw-window-handle = "0.6"
+pollster = "0.3"
+
+# Clipboard + input
+arboard = "3"
 enigo = "0.6"
+
+# Data
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
