@@ -9,14 +9,15 @@ pub fn draw_ui(
     popup_origin: egui::Pos2,
     texture_cache: &mut HashMap<usize, egui::TextureHandle>,
 ) -> Option<ClipboardItem> {
+    let _ = popup_origin;
     let mut selected_item: Option<ClipboardItem> = None;
 
-    egui::Window::new("clipboard_popup")
-        .title_bar(false)
-        .resizable(false)
-        .collapsible(false)
-        .fixed_pos(popup_origin)
-        .fixed_size([350.0, 450.0])
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::default()
+                .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 28, 245))
+                .inner_margin(egui::Margin::same(16.0)),
+        )
         .show(ctx, |ui| {
             ui.heading("Clipboard History");
             ui.separator();
@@ -43,23 +44,20 @@ pub fn draw_ui(
                                     ui.button(display_text).clicked()
                                 }
                                 ClipboardContent::Image(img_data) => {
-                                    let texture =
-                                        texture_cache.entry(i).or_insert_with(|| {
-                                            let image =
-                                                egui::ColorImage::from_rgba_unmultiplied(
-                                                    [img_data.width, img_data.height],
-                                                    &img_data.bytes,
-                                                );
-                                            ctx.load_texture(
-                                                format!("img_{}", i),
-                                                image,
-                                                egui::TextureOptions::LINEAR,
-                                            )
-                                        });
+                                    let texture = texture_cache.entry(i).or_insert_with(|| {
+                                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                                            [img_data.width, img_data.height],
+                                            &img_data.bytes,
+                                        );
+                                        ctx.load_texture(
+                                            format!("img_{}", i),
+                                            image,
+                                            egui::TextureOptions::LINEAR,
+                                        )
+                                    });
 
                                     let max_height = 150.0_f32;
-                                    let aspect =
-                                        img_data.width as f32 / img_data.height as f32;
+                                    let aspect = img_data.width as f32 / img_data.height as f32;
                                     let width = ui.available_width();
                                     let height = (width / aspect).min(max_height);
                                     let size = egui::vec2(width * 0.9, height);
@@ -85,13 +83,11 @@ pub fn draw_ui(
         });
 
     if let Some(ref item) = selected_item {
-        // Move selected item to front
         if let Some(pos) = history.iter().position(|x| x == item) {
             let removed = history.remove(pos);
             history.insert(0, removed);
         }
 
-        // Put it on the system clipboard
         if let Ok(mut clipboard) = Clipboard::new() {
             match &item.content {
                 ClipboardContent::Text(text) => {

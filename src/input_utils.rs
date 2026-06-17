@@ -10,10 +10,6 @@ pub struct InputUtils;
 
 impl InputUtils {
     pub fn get_mouse_position() -> (f32, f32) {
-        if is_wayland() {
-            // Wayland doesn't allow global cursor position queries
-            return (100.0, 100.0);
-        }
         match Enigo::new(&Settings::default()) {
             Ok(enigo) => match enigo.location() {
                 Ok((x, y)) => (x as f32, y as f32),

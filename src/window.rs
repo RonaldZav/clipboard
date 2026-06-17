@@ -9,7 +9,8 @@ use std::ptr::NonNull;
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_xdg_shell,
+    delegate_xdg_window,
     delegate_pointer, delegate_registry, delegate_seat,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -21,10 +22,7 @@ use smithay_client_toolkit::{
     },
     shell::{
         WaylandSurface,
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler,
-            LayerSurface, LayerSurfaceConfigure,
-        },
+        xdg::{window::{Window, WindowConfigure, WindowDecorations, WindowHandler}, XdgShell},
     },
 };
 
@@ -94,8 +92,8 @@ pub struct AppState {
     output_state: OutputState,
     compositor_state: CompositorState,
     #[allow(dead_code)]
-    layer_shell: LayerShell,
-    layer: LayerSurface,
+    xdg_shell: XdgShell,
+    window: Option<Window>,
 
     // Input devices
     keyboard: Option<WlKeyboard>,
@@ -107,7 +105,6 @@ pub struct AppState {
     // App visibility / lifecycle
     visible: bool,
     shown_at: Instant,
-    should_exit: bool,
     configured: bool,
     width: u32,
     height: u32,
@@ -132,17 +129,47 @@ pub struct AppState {
     stop_rx: Receiver<()>,
     texture_cache: HashMap<usize, egui::TextureHandle>,
 
-    // Raw Wayland handles needed for wgpu surface creation
     display_ptr: *mut std::ffi::c_void,
-    surface_ptr: *mut std::ffi::c_void,
+    surface_ptr: Option<*mut std::ffi::c_void>,
 }
 
 // Safety: AppState is only ever accessed from the single event-loop thread.
 unsafe impl Send for AppState {}
 
 impl AppState {
+    fn create_window(&mut self, qh: &QueueHandle<Self>) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let surface = self.compositor_state.create_surface(qh);
+        self.surface_ptr = Some(surface.id().as_ptr() as *mut std::ffi::c_void);
+
+        let window = self
+            .xdg_shell
+            .create_window(surface, WindowDecorations::RequestServer, qh);
+        window.set_title("Clipboard");
+        window.set_app_id("io.github.ronaldzav.clipboard");
+        window.set_min_size(Some((350, 450)));
+        window.commit();
+
+        self.width = 350;
+        self.height = 450;
+        self.configured = false;
+        self.wgpu_device = None;
+        self.wgpu_queue = None;
+        self.wgpu_surface = None;
+        self.egui_renderer = None;
+        self.texture_cache.clear();
+
+        self.window = Some(window);
+    }
+
     fn set_input_region_empty(&self) {
-        let wl_surface = self.layer.wl_surface();
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let wl_surface = window.wl_surface();
         // An empty region means no input hits the surface → clicks pass through
         if let Ok(region) = Region::new(&self.compositor_state) {
             // Don't call region.add(…) — leave it empty
@@ -152,15 +179,21 @@ impl AppState {
     }
 
     fn set_input_region_full(&self) {
-        let wl_surface = self.layer.wl_surface();
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let wl_surface = window.wl_surface();
         // No region = compositor defaults to full surface receiving input
         wl_surface.set_input_region(None);
         wl_surface.commit();
     }
 
-    fn show(&mut self) {
+    fn show(&mut self, qh: &QueueHandle<Self>) {
+        self.create_window(qh);
         self.visible = true;
         self.shown_at = Instant::now();
+        let (mouse_x, mouse_y) = InputUtils::get_mouse_position();
+        self.pointer_pos = (mouse_x as f64, mouse_y as f64);
         // Record where the popup should appear
         self.popup_origin = egui::pos2(
             self.pointer_pos.0 as f32,
@@ -172,15 +205,21 @@ impl AppState {
         self.popup_origin.x = self.popup_origin.x.min(max_x);
         self.popup_origin.y = self.popup_origin.y.min(max_y);
 
-        self.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        self.layer.commit();
         self.set_input_region_full();
+        self.render_frame();
     }
 
     fn hide(&mut self) {
         self.visible = false;
-        self.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        self.layer.commit();
+        self.window.take();
+        self.wgpu_surface = None;
+        self.wgpu_device = None;
+        self.wgpu_queue = None;
+        self.egui_renderer = None;
+        self.surface_format = None;
+        self.configured = false;
+        self.surface_ptr = None;
+        self.texture_cache.clear();
         self.set_input_region_empty();
     }
 
@@ -193,8 +232,11 @@ impl AppState {
         let raw_display = RawDisplayHandle::Wayland(
             WaylandDisplayHandle::new(NonNull::new(self.display_ptr).unwrap()),
         );
+        let Some(surface_ptr) = self.surface_ptr else {
+            return;
+        };
         let raw_window = RawWindowHandle::Wayland(
-            WaylandWindowHandle::new(NonNull::new(self.surface_ptr).unwrap()),
+            WaylandWindowHandle::new(NonNull::new(surface_ptr).unwrap()),
         );
 
         // Safety: the display and surface pointers are valid for the lifetime of the
@@ -320,12 +362,16 @@ impl AppState {
         let history_arc = self.history.clone();
         let texture_cache = &mut self.texture_cache as *mut HashMap<usize, egui::TextureHandle>;
 
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            // Safety: texture_cache is only accessed here and nowhere else during this closure
-            let tc = unsafe { &mut *texture_cache };
-            let mut history = history_arc.lock().unwrap();
-            draw_ui(ctx, &mut *history, popup_origin, tc);
-        });
+        let full_output = if self.visible {
+            self.egui_ctx.run(raw_input, |ctx| {
+                // Safety: texture_cache is only accessed here and nowhere else during this closure
+                let tc = unsafe { &mut *texture_cache };
+                let mut history = history_arc.lock().unwrap();
+                draw_ui(ctx, &mut *history, popup_origin, tc);
+            })
+        } else {
+            self.egui_ctx.run(raw_input, |_| {})
+        };
 
         let renderer = match self.egui_renderer.as_mut() {
             Some(r) => r,
@@ -446,25 +492,24 @@ impl OutputHandler for AppState {
     }
 }
 
-impl LayerShellHandler for AppState {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.should_exit = true;
+impl WindowHandler for AppState {
+    fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _window: &Window) {
+        self.hide();
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-        configure: LayerSurfaceConfigure,
+        _window: &Window,
+        configure: WindowConfigure,
         _serial: u32,
     ) {
-        let (w, h) = configure.new_size;
-        if w > 0 {
-            self.width = w;
+        if let Some(w) = configure.new_size.0 {
+            self.width = w.get();
         }
-        if h > 0 {
-            self.height = h;
+        if let Some(h) = configure.new_size.1 {
+            self.height = h.get();
         }
 
         if !self.configured {
@@ -474,6 +519,10 @@ impl LayerShellHandler for AppState {
             self.set_input_region_empty();
         } else {
             self.reconfigure_surface();
+        }
+
+        if self.visible {
+            self.render_frame();
         }
     }
 }
@@ -697,7 +746,8 @@ delegate_output!(AppState);
 delegate_seat!(AppState);
 delegate_keyboard!(AppState);
 delegate_pointer!(AppState);
-delegate_layer!(AppState);
+delegate_xdg_shell!(AppState);
+delegate_xdg_window!(AppState);
 delegate_registry!(AppState);
 
 // ─── Key translation helpers ──────────────────────────────────────────────────
@@ -766,9 +816,16 @@ pub fn run(
     stop_rx: Receiver<()>,
     start_hidden: bool,
 ) {
-    let conn = Connection::connect_to_env().expect("Failed to connect to Wayland display");
+    let conn = match Connection::connect_to_env() {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("Failed to connect to Wayland display: {e}");
+            eprintln!("This clipboard manager requires a Wayland session.");
+            return;
+        }
+    };
 
-    // display_ptr requires the "system" feature on wayland-client
+    // Needed for wgpu surface creation on Wayland when using raw handles.
     let display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
 
     let (globals, mut event_queue) =
@@ -777,29 +834,17 @@ pub fn run(
 
     let compositor_state =
         CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
-    let layer_shell = LayerShell::bind(&globals, &qh).expect("zwlr_layer_shell_v1 not available");
+    let xdg_shell = match XdgShell::bind(&globals, &qh) {
+        Ok(xdg_shell) => xdg_shell,
+        Err(_) => {
+            eprintln!("xdg_wm_base not available");
+            eprintln!("This clipboard manager requires a compositor with xdg-shell support.");
+            return;
+        }
+    };
     let seat_state = SeatState::new(&globals, &qh);
     let output_state = OutputState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
-
-    // Create the wl_surface — capture ptr BEFORE handing off to layer_shell
-    let surface = compositor_state.create_surface(&qh);
-    let surface_ptr = surface.id().as_ptr() as *mut std::ffi::c_void;
-
-    let layer = layer_shell.create_layer_surface(
-        &qh,
-        surface,
-        Layer::Top,
-        Some("clipboard"),
-        None,
-    );
-
-    // Full-screen overlay
-    layer.set_anchor(Anchor::all());
-    layer.set_size(0, 0);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer.set_exclusive_zone(-1);
-    layer.commit();
 
     let egui_ctx = egui::Context::default();
 
@@ -808,17 +853,19 @@ pub fn run(
         seat_state,
         output_state,
         compositor_state,
-        layer_shell,
-        layer,
+        xdg_shell,
+        window: None,
         keyboard: None,
         pointer: None,
-        pointer_pos: (100.0, 100.0),
+        pointer_pos: {
+            let (mouse_x, mouse_y) = InputUtils::get_mouse_position();
+            (mouse_x as f64, mouse_y as f64)
+        },
         visible: false,
         shown_at: Instant::now(),
-        should_exit: false,
         configured: false,
-        width: 1920,
-        height: 1080,
+        width: 350,
+        height: 450,
         wgpu_device: None,
         wgpu_queue: None,
         wgpu_surface: None,
@@ -832,19 +879,15 @@ pub fn run(
         stop_rx,
         texture_cache: HashMap::new(),
         display_ptr,
-        surface_ptr,
+        surface_ptr: None,
     };
+
+    if !start_hidden {
+        state.show(&qh);
+    }
 
     // Initial roundtrip to receive the configure event (and trigger init_wgpu)
     event_queue.roundtrip(&mut state).unwrap();
-
-    if !start_hidden {
-        state.popup_origin = egui::pos2(
-            state.width as f32 / 2.0 - 175.0,
-            state.height as f32 / 2.0 - 225.0,
-        );
-        state.show();
-    }
 
     // ─── Event loop ───────────────────────────────────────────────────────────
     loop {
@@ -853,11 +896,11 @@ pub fn run(
             break;
         }
         if state.show_rx.try_recv().is_ok() {
-            state.show();
-        }
-
-        if state.should_exit {
-            break;
+            state.show(&qh);
+            if let Err(e) = event_queue.roundtrip(&mut state) {
+                eprintln!("roundtrip after show error: {:?}", e);
+                break;
+            }
         }
 
         if state.visible {
@@ -900,11 +943,16 @@ pub fn run(
 
             std::thread::sleep(std::time::Duration::from_millis(16));
         } else {
-            // Blocking dispatch when hidden — low CPU usage
-            if let Err(e) = event_queue.blocking_dispatch(&mut state) {
+            // Keep polling so IPC show/stop signals can reopen the window while hidden.
+            if let Err(e) = event_queue.dispatch_pending(&mut state) {
                 eprintln!("blocking_dispatch error: {:?}", e);
                 break;
             }
+            if let Err(e) = conn.flush() {
+                eprintln!("conn flush error: {:?}", e);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 

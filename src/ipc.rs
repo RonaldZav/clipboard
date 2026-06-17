@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::io::{self, BufRead};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -67,6 +68,36 @@ pub fn start_listener(listener: UnixListener, show_tx: Sender<()>, stop_tx: Send
                     }
                 }
                 Err(e) => eprintln!("Error accepting connection: {}", e),
+            }
+        }
+    });
+}
+
+pub fn start_stdin_listener(show_tx: Sender<()>, stop_tx: Sender<()>) {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut lines = stdin.lock().lines();
+
+        while let Some(line) = lines.next() {
+            match line {
+                Ok(command) => match command.trim() {
+                    "show" | "cb show" => {
+                        let _ = show_tx.send(());
+                    }
+                    "stop" | "cb stop" => {
+                        let _ = stop_tx.send(());
+                        break;
+                    }
+                    "" => {}
+                    other => {
+                        eprintln!("Unknown command: {}", other);
+                        eprintln!("Available commands: show, stop");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("stdin read error: {}", e);
+                    break;
+                }
             }
         }
     });

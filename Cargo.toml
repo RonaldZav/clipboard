@@ -4,19 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Wayland layer shell
-wayland-client = { version = "0.31", features = ["system"] }
-smithay-client-toolkit = { version = "0.18", features = ["calloop"] }
-
-# GPU rendering
-wgpu = "0.20"
-egui = "0.28"
-egui-wgpu = "0.28"
-raw-window-handle = "0.6"
-pollster = "0.3"
+# GTK4 UI
+gtk4 = "0.11"
 
 # Clipboard + input
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 enigo = "0.6"
 
 # Data
